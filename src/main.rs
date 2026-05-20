@@ -11,7 +11,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     let listener = TcpListener::bind(config.bind_addr).await?;
     let state = Arc::new(AppState::new(
-        config.api_key.clone(),
+        config.jws_secret.clone(),
         config.default_realm_id,
         Arc::new(MariadbCliSink::from_config(&config)),
         Arc::new(SystemClock),

@@ -4,13 +4,17 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use bytes::Bytes;
-use http::header::{CONTENT_TYPE, HeaderMap};
+use hmac::{Hmac, Mac};
+use http::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap};
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::Sha256;
 use thiserror::Error;
 
 #[cfg(test)]
@@ -19,13 +23,14 @@ use std::sync::Mutex;
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
 const DEFAULT_REALM_ID_STR: &str = "1";
 const MAX_COMMAND_LEN: usize = 512;
+type HmacSha256 = Hmac<Sha256>;
 
 pub type ResponseBody = Full<Bytes>;
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
-    pub api_key: String,
+    pub jws_secret: String,
     pub db_host: String,
     pub db_port: u16,
     pub db_user: String,
@@ -50,7 +55,7 @@ impl Config {
         let bind_addr = bind_addr
             .parse::<SocketAddr>()
             .map_err(|_| ConfigError::InvalidBindAddr(bind_addr.clone()))?;
-        let api_key = required_env("GM_TOOL_API_KEY")?;
+        let jws_secret = required_env("GM_TOOL_JWS_SECRET")?;
         let db_host = required_env("TWOW_DB_HOST")?;
         let db_port = parse_env_u16("TWOW_DB_PORT", "3306")?;
         let db_user = required_env("TWOW_DB_USER")?;
@@ -60,7 +65,7 @@ impl Config {
 
         Ok(Self {
             bind_addr,
-            api_key,
+            jws_secret,
             db_host,
             db_port,
             db_user,
@@ -91,7 +96,7 @@ fn parse_env_u32(key: &'static str, default: &'static str) -> Result<u32, Config
 
 #[derive(Clone)]
 pub struct AppState {
-    api_key: Arc<String>,
+    jws_secret: Arc<Vec<u8>>,
     default_realm_id: u32,
     sink: Arc<dyn CommandSink>,
     clock: Arc<dyn Clock>,
@@ -99,13 +104,13 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(
-        api_key: String,
+        jws_secret: String,
         default_realm_id: u32,
         sink: Arc<dyn CommandSink>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
-            api_key: Arc::new(api_key),
+            jws_secret: Arc::new(jws_secret.into_bytes()),
             default_realm_id,
             sink,
             clock,
@@ -297,6 +302,18 @@ struct HealthPayload<'a> {
     status: &'a str,
 }
 
+#[derive(Debug, Deserialize)]
+struct JwsHeader {
+    alg: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct JwsClaims {
+    exp: u64,
+    #[serde(default)]
+    nbf: Option<u64>,
+}
+
 pub async fn handle_request(
     state: Arc<AppState>,
     request: Request<Incoming>,
@@ -337,12 +354,12 @@ async fn route_request(
         (Method::GET, "/healthz") => Ok(json_response(StatusCode::OK, json!(HealthPayload { status: "ok" }))),
         (Method::GET, "/readyz") => readyz(state).await,
         (Method::POST, "/api/v1/gm/commands") => {
-            authorize(headers, &state.api_key)?;
+            authorize(headers, state.jws_secret.as_slice(), state.clock.now_epoch_seconds())?;
             let payload: RawCommandRequest = parse_json(&body)?;
             enqueue_from_raw(state, payload).await
         }
         (Method::POST, "/api/v1/gm/revive") => {
-            authorize(headers, &state.api_key)?;
+            authorize(headers, state.jws_secret.as_slice(), state.clock.now_epoch_seconds())?;
             let payload: ReviveRequest = parse_json(&body)?;
             enqueue_structured(
                 state,
@@ -353,7 +370,7 @@ async fn route_request(
             .await
         }
         (Method::POST, "/api/v1/gm/teleport") => {
-            authorize(headers, &state.api_key)?;
+            authorize(headers, state.jws_secret.as_slice(), state.clock.now_epoch_seconds())?;
             let payload: TeleportRequest = parse_json(&body)?;
             enqueue_structured(
                 state,
@@ -413,17 +430,55 @@ async fn enqueue_structured(
     ))
 }
 
-fn authorize(headers: &HeaderMap, expected: &str) -> Result<(), AppError> {
-    let api_key = headers
-        .get("X-API-Key")
+fn authorize(headers: &HeaderMap, secret: &[u8], now_epoch_seconds: u64) -> Result<(), AppError> {
+    let token = headers
+        .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(AppError::Unauthorized)?;
 
-    if api_key == expected {
-        Ok(())
-    } else {
-        Err(AppError::Unauthorized)
+    verify_jws(token, secret, now_epoch_seconds)
+}
+
+fn verify_jws(token: &str, secret: &[u8], now_epoch_seconds: u64) -> Result<(), AppError> {
+    let mut parts = token.split('.');
+    let header_b64 = parts.next().ok_or(AppError::Unauthorized)?;
+    let payload_b64 = parts.next().ok_or(AppError::Unauthorized)?;
+    let signature_b64 = parts.next().ok_or(AppError::Unauthorized)?;
+    if parts.next().is_some() {
+        return Err(AppError::Unauthorized);
     }
+
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let header_bytes = URL_SAFE_NO_PAD.decode(header_b64).map_err(|_| AppError::Unauthorized)?;
+    let payload_bytes = URL_SAFE_NO_PAD.decode(payload_b64).map_err(|_| AppError::Unauthorized)?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(signature_b64)
+        .map_err(|_| AppError::Unauthorized)?;
+
+    let header: JwsHeader = serde_json::from_slice(&header_bytes).map_err(|_| AppError::Unauthorized)?;
+    if header.alg != "HS256" {
+        return Err(AppError::Unauthorized);
+    }
+
+    let mut mac = HmacSha256::new_from_slice(secret)
+        .map_err(|error| AppError::Internal(format!("invalid JWS secret: {error}")))?;
+    mac.update(signing_input.as_bytes());
+    mac.verify_slice(&signature).map_err(|_| AppError::Unauthorized)?;
+
+    let claims: JwsClaims = serde_json::from_slice(&payload_bytes).map_err(|_| AppError::Unauthorized)?;
+    if claims.exp <= now_epoch_seconds {
+        return Err(AppError::Unauthorized);
+    }
+    if let Some(nbf) = claims.nbf {
+        if now_epoch_seconds < nbf {
+            return Err(AppError::Unauthorized);
+        }
+    }
+
+    Ok(())
 }
 
 fn parse_json<T>(body: &[u8]) -> Result<T, AppError>
@@ -552,14 +607,25 @@ mod tests {
     use super::*;
 
     const DEFAULT_REALM_ID: u32 = 1;
+    const TEST_SECRET: &str = "secret";
 
     fn build_state() -> Arc<AppState> {
         Arc::new(AppState::new(
-            "secret".to_string(),
+            TEST_SECRET.to_string(),
             DEFAULT_REALM_ID,
             Arc::new(RecordingSink::with_ready(true)),
             Arc::new(FixedClock(1_717_171_717)),
         ))
+    }
+
+    fn sign_test_jws(secret: &str, claims: serde_json::Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
+        let signing_input = format!("{header}.{payload}");
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("test secret");
+        mac.update(signing_input.as_bytes());
+        let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        format!("{signing_input}.{signature}")
     }
 
     async fn call(
@@ -567,12 +633,17 @@ mod tests {
         method: Method,
         path: &str,
         body: serde_json::Value,
-        api_key: Option<&str>,
+        token: Option<&str>,
     ) -> Response<ResponseBody> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, "application/json".parse().expect("content-type header"));
-        if let Some(value) = api_key {
-            headers.insert("X-API-Key", value.parse().expect("api key header"));
+        if let Some(value) = token {
+            headers.insert(
+                AUTHORIZATION,
+                format!("Bearer {value}")
+                    .parse()
+                    .expect("authorization header"),
+            );
         }
 
         route_request(state, method, path, &headers, Bytes::from(body.to_string()))
@@ -584,18 +655,19 @@ mod tests {
     async fn revive_endpoint_queues_expected_command() {
         let sink = Arc::new(RecordingSink::with_ready(true));
         let state = Arc::new(AppState::new(
-            "secret".to_string(),
+            TEST_SECRET.to_string(),
             DEFAULT_REALM_ID,
             sink.clone(),
             Arc::new(FixedClock(100)),
         ));
+        let token = sign_test_jws(TEST_SECRET, json!({"sub":"test","exp":101}));
 
         let response = call(
             state,
             Method::POST,
             "/api/v1/gm/revive",
             json!({"character":"Qianfuren","realm_id":7}),
-            Some("secret"),
+            Some(&token),
         )
         .await;
 
@@ -618,7 +690,7 @@ mod tests {
             Method::POST,
             "/api/v1/gm/teleport",
             json!({"character":"Qianfuren","teleport":"gm island"}),
-            Some("secret"),
+            Some(&sign_test_jws(TEST_SECRET, json!({"sub":"test","exp":1_717_171_718u64}))),
         )
         .await;
 
@@ -629,18 +701,19 @@ mod tests {
     async fn raw_endpoint_strips_leading_dot() {
         let sink = Arc::new(RecordingSink::with_ready(true));
         let state = Arc::new(AppState::new(
-            "secret".to_string(),
+            TEST_SECRET.to_string(),
             DEFAULT_REALM_ID,
             sink.clone(),
             Arc::new(FixedClock(200)),
         ));
+        let token = sign_test_jws(TEST_SECRET, json!({"sub":"test","exp":205}));
 
         let response = call(
             state,
             Method::POST,
             "/api/v1/gm/commands",
             json!({"command":".broadcast hello","run_after_seconds":5}),
-            Some("secret"),
+            Some(&token),
         )
         .await;
 
@@ -651,7 +724,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_endpoints_require_api_key() {
+    async fn write_endpoints_require_valid_jws() {
         let response = call(
             build_state(),
             Method::POST,
@@ -665,9 +738,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_jws_is_rejected() {
+        let response = call(
+            build_state(),
+            Method::POST,
+            "/api/v1/gm/revive",
+            json!({"character":"Qianfuren"}),
+            Some(&sign_test_jws(TEST_SECRET, json!({"sub":"test","exp":1_717_171_716u64}))),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn invalid_jws_signature_is_rejected() {
+        let response = call(
+            build_state(),
+            Method::POST,
+            "/api/v1/gm/revive",
+            json!({"character":"Qianfuren"}),
+            Some(&sign_test_jws("wrong-secret", json!({"sub":"test","exp":1_717_171_718u64}))),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn readyz_reflects_sink_health() {
         let state = Arc::new(AppState::new(
-            "secret".to_string(),
+            TEST_SECRET.to_string(),
             DEFAULT_REALM_ID,
             Arc::new(RecordingSink::with_ready(false)),
             Arc::new(FixedClock(0)),
