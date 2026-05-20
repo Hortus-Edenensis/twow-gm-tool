@@ -111,6 +111,9 @@ For the smallest runtime validation shape, the parent repo also ships a
 single-Pod manifest that runs MariaDB and `twow-gm-tool` together:
 
 ```bash
+podman build -t localhost/twow-gm-tool:local tools/twow-gm-tool
+podman save --format docker-archive localhost/twow-gm-tool:local -o /tmp/twow-gm-tool-local.tar
+sudo k3s ctr images import /tmp/twow-gm-tool-local.tar
 kubectl -n twow-control-plane create secret generic twow-gm-tool-secret \
   --from-literal=GM_TOOL_API_KEY='replace-me'
 kubectl apply -f k8s/experiments/twow-gm-tool-k3s/proof-pod.yaml
