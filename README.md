@@ -107,6 +107,15 @@ For a non-systemd local proof path, see the parent repo helper:
 bash scripts/run_twow_gm_tool_rootless_k3s_proof.sh --print-only
 ```
 
+For the smallest runtime validation shape, the parent repo also ships a
+single-Pod manifest that runs MariaDB and `twow-gm-tool` together:
+
+```bash
+kubectl -n twow-control-plane create secret generic twow-gm-tool-secret \
+  --from-literal=GM_TOOL_API_KEY='replace-me'
+kubectl apply -f k8s/experiments/twow-gm-tool-k3s/proof-pod.yaml
+```
+
 ## Curl Example
 
 ```bash
