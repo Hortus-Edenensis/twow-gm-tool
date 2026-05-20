@@ -101,6 +101,12 @@ kubectl -n twow-control-plane create secret generic twow-gm-tool-secret \
   --from-literal=GM_TOOL_API_KEY='replace-me'
 ```
 
+For a non-systemd local proof path, see the parent repo helper:
+
+```bash
+bash scripts/run_twow_gm_tool_rootless_k3s_proof.sh --print-only
+```
+
 ## Curl Example
 
 ```bash
@@ -118,6 +124,7 @@ This directory is intended to live as a dedicated git submodule:
 - intended remote: `https://github.com/Hortus-Edenensis/twow-gm-tool.git`
 - intended image: `ghcr.io/hortus-edenensis/twow-gm-tool`
 
-The current parent repo patch prepares the submodule metadata and local nested
-repository shape. If GitHub credentials are unavailable, the final remote repo
-creation and first push remain a one-time follow-up step.
+The parent repo patch prepares the submodule metadata and local nested
+repository shape. The GitHub repository now exists, but the first content push
+still depends on explicit approval to export workspace code to the public
+remote.
