@@ -31,6 +31,8 @@ pub type ResponseBody = Full<Bytes>;
 pub struct Config {
     pub bind_addr: SocketAddr,
     pub jws_secret: String,
+    pub jws_issuer: String,
+    pub jws_audience: String,
     pub db_host: String,
     pub db_port: u16,
     pub db_user: String,
@@ -56,6 +58,8 @@ impl Config {
             .parse::<SocketAddr>()
             .map_err(|_| ConfigError::InvalidBindAddr(bind_addr.clone()))?;
         let jws_secret = required_env("GM_TOOL_JWS_SECRET")?;
+        let jws_issuer = required_env("GM_TOOL_JWS_ISSUER")?;
+        let jws_audience = required_env("GM_TOOL_JWS_AUDIENCE")?;
         let db_host = required_env("TWOW_DB_HOST")?;
         let db_port = parse_env_u16("TWOW_DB_PORT", "3306")?;
         let db_user = required_env("TWOW_DB_USER")?;
@@ -66,6 +70,8 @@ impl Config {
         Ok(Self {
             bind_addr,
             jws_secret,
+            jws_issuer,
+            jws_audience,
             db_host,
             db_port,
             db_user,
@@ -97,6 +103,8 @@ fn parse_env_u32(key: &'static str, default: &'static str) -> Result<u32, Config
 #[derive(Clone)]
 pub struct AppState {
     jws_secret: Arc<Vec<u8>>,
+    jws_issuer: Arc<String>,
+    jws_audience: Arc<String>,
     default_realm_id: u32,
     sink: Arc<dyn CommandSink>,
     clock: Arc<dyn Clock>,
@@ -105,12 +113,16 @@ pub struct AppState {
 impl AppState {
     pub fn new(
         jws_secret: String,
+        jws_issuer: String,
+        jws_audience: String,
         default_realm_id: u32,
         sink: Arc<dyn CommandSink>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             jws_secret: Arc::new(jws_secret.into_bytes()),
+            jws_issuer: Arc::new(jws_issuer),
+            jws_audience: Arc::new(jws_audience),
             default_realm_id,
             sink,
             clock,
@@ -308,7 +320,25 @@ struct JwsHeader {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum JwsAudience {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl JwsAudience {
+    fn contains(&self, expected: &str) -> bool {
+        match self {
+            Self::One(value) => value == expected,
+            Self::Many(values) => values.iter().any(|value| value == expected),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct JwsClaims {
+    iss: String,
+    aud: JwsAudience,
     exp: u64,
     #[serde(default)]
     nbf: Option<u64>,
@@ -354,12 +384,24 @@ async fn route_request(
         (Method::GET, "/healthz") => Ok(json_response(StatusCode::OK, json!(HealthPayload { status: "ok" }))),
         (Method::GET, "/readyz") => readyz(state).await,
         (Method::POST, "/api/v1/gm/commands") => {
-            authorize(headers, state.jws_secret.as_slice(), state.clock.now_epoch_seconds())?;
+            authorize(
+                headers,
+                state.jws_secret.as_slice(),
+                state.jws_issuer.as_str(),
+                state.jws_audience.as_str(),
+                state.clock.now_epoch_seconds(),
+            )?;
             let payload: RawCommandRequest = parse_json(&body)?;
             enqueue_from_raw(state, payload).await
         }
         (Method::POST, "/api/v1/gm/revive") => {
-            authorize(headers, state.jws_secret.as_slice(), state.clock.now_epoch_seconds())?;
+            authorize(
+                headers,
+                state.jws_secret.as_slice(),
+                state.jws_issuer.as_str(),
+                state.jws_audience.as_str(),
+                state.clock.now_epoch_seconds(),
+            )?;
             let payload: ReviveRequest = parse_json(&body)?;
             enqueue_structured(
                 state,
@@ -370,7 +412,13 @@ async fn route_request(
             .await
         }
         (Method::POST, "/api/v1/gm/teleport") => {
-            authorize(headers, state.jws_secret.as_slice(), state.clock.now_epoch_seconds())?;
+            authorize(
+                headers,
+                state.jws_secret.as_slice(),
+                state.jws_issuer.as_str(),
+                state.jws_audience.as_str(),
+                state.clock.now_epoch_seconds(),
+            )?;
             let payload: TeleportRequest = parse_json(&body)?;
             enqueue_structured(
                 state,
@@ -430,7 +478,13 @@ async fn enqueue_structured(
     ))
 }
 
-fn authorize(headers: &HeaderMap, secret: &[u8], now_epoch_seconds: u64) -> Result<(), AppError> {
+fn authorize(
+    headers: &HeaderMap,
+    secret: &[u8],
+    expected_issuer: &str,
+    expected_audience: &str,
+    now_epoch_seconds: u64,
+) -> Result<(), AppError> {
     let token = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -439,10 +493,22 @@ fn authorize(headers: &HeaderMap, secret: &[u8], now_epoch_seconds: u64) -> Resu
         .filter(|value| !value.is_empty())
         .ok_or(AppError::Unauthorized)?;
 
-    verify_jws(token, secret, now_epoch_seconds)
+    verify_jws(
+        token,
+        secret,
+        expected_issuer,
+        expected_audience,
+        now_epoch_seconds,
+    )
 }
 
-fn verify_jws(token: &str, secret: &[u8], now_epoch_seconds: u64) -> Result<(), AppError> {
+fn verify_jws(
+    token: &str,
+    secret: &[u8],
+    expected_issuer: &str,
+    expected_audience: &str,
+    now_epoch_seconds: u64,
+) -> Result<(), AppError> {
     let mut parts = token.split('.');
     let header_b64 = parts.next().ok_or(AppError::Unauthorized)?;
     let payload_b64 = parts.next().ok_or(AppError::Unauthorized)?;
@@ -469,6 +535,12 @@ fn verify_jws(token: &str, secret: &[u8], now_epoch_seconds: u64) -> Result<(), 
     mac.verify_slice(&signature).map_err(|_| AppError::Unauthorized)?;
 
     let claims: JwsClaims = serde_json::from_slice(&payload_bytes).map_err(|_| AppError::Unauthorized)?;
+    if claims.iss != expected_issuer {
+        return Err(AppError::Unauthorized);
+    }
+    if !claims.aud.contains(expected_audience) {
+        return Err(AppError::Unauthorized);
+    }
     if claims.exp <= now_epoch_seconds {
         return Err(AppError::Unauthorized);
     }
@@ -608,10 +680,14 @@ mod tests {
 
     const DEFAULT_REALM_ID: u32 = 1;
     const TEST_SECRET: &str = "secret";
+    const TEST_ISSUER: &str = "twow-control-plane";
+    const TEST_AUDIENCE: &str = "twow-gm-tool";
 
     fn build_state() -> Arc<AppState> {
         Arc::new(AppState::new(
             TEST_SECRET.to_string(),
+            TEST_ISSUER.to_string(),
+            TEST_AUDIENCE.to_string(),
             DEFAULT_REALM_ID,
             Arc::new(RecordingSink::with_ready(true)),
             Arc::new(FixedClock(1_717_171_717)),
@@ -656,11 +732,16 @@ mod tests {
         let sink = Arc::new(RecordingSink::with_ready(true));
         let state = Arc::new(AppState::new(
             TEST_SECRET.to_string(),
+            TEST_ISSUER.to_string(),
+            TEST_AUDIENCE.to_string(),
             DEFAULT_REALM_ID,
             sink.clone(),
             Arc::new(FixedClock(100)),
         ));
-        let token = sign_test_jws(TEST_SECRET, json!({"sub":"test","exp":101}));
+        let token = sign_test_jws(
+            TEST_SECRET,
+            json!({"sub":"test","iss":TEST_ISSUER,"aud":TEST_AUDIENCE,"exp":101}),
+        );
 
         let response = call(
             state,
@@ -690,7 +771,10 @@ mod tests {
             Method::POST,
             "/api/v1/gm/teleport",
             json!({"character":"Qianfuren","teleport":"gm island"}),
-            Some(&sign_test_jws(TEST_SECRET, json!({"sub":"test","exp":1_717_171_718u64}))),
+            Some(&sign_test_jws(
+                TEST_SECRET,
+                json!({"sub":"test","iss":TEST_ISSUER,"aud":TEST_AUDIENCE,"exp":1_717_171_718u64}),
+            )),
         )
         .await;
 
@@ -702,11 +786,16 @@ mod tests {
         let sink = Arc::new(RecordingSink::with_ready(true));
         let state = Arc::new(AppState::new(
             TEST_SECRET.to_string(),
+            TEST_ISSUER.to_string(),
+            TEST_AUDIENCE.to_string(),
             DEFAULT_REALM_ID,
             sink.clone(),
             Arc::new(FixedClock(200)),
         ));
-        let token = sign_test_jws(TEST_SECRET, json!({"sub":"test","exp":205}));
+        let token = sign_test_jws(
+            TEST_SECRET,
+            json!({"sub":"test","iss":TEST_ISSUER,"aud":TEST_AUDIENCE,"exp":205}),
+        );
 
         let response = call(
             state,
@@ -744,7 +833,10 @@ mod tests {
             Method::POST,
             "/api/v1/gm/revive",
             json!({"character":"Qianfuren"}),
-            Some(&sign_test_jws(TEST_SECRET, json!({"sub":"test","exp":1_717_171_716u64}))),
+            Some(&sign_test_jws(
+                TEST_SECRET,
+                json!({"sub":"test","iss":TEST_ISSUER,"aud":TEST_AUDIENCE,"exp":1_717_171_716u64}),
+            )),
         )
         .await;
 
@@ -758,7 +850,10 @@ mod tests {
             Method::POST,
             "/api/v1/gm/revive",
             json!({"character":"Qianfuren"}),
-            Some(&sign_test_jws("wrong-secret", json!({"sub":"test","exp":1_717_171_718u64}))),
+            Some(&sign_test_jws(
+                "wrong-secret",
+                json!({"sub":"test","iss":TEST_ISSUER,"aud":TEST_AUDIENCE,"exp":1_717_171_718u64}),
+            )),
         )
         .await;
 
@@ -769,6 +864,8 @@ mod tests {
     async fn readyz_reflects_sink_health() {
         let state = Arc::new(AppState::new(
             TEST_SECRET.to_string(),
+            TEST_ISSUER.to_string(),
+            TEST_AUDIENCE.to_string(),
             DEFAULT_REALM_ID,
             Arc::new(RecordingSink::with_ready(false)),
             Arc::new(FixedClock(0)),
@@ -779,5 +876,67 @@ mod tests {
             .unwrap_err()
             .response();
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn wrong_issuer_is_rejected() {
+        let response = call(
+            build_state(),
+            Method::POST,
+            "/api/v1/gm/revive",
+            json!({"character":"Qianfuren"}),
+            Some(&sign_test_jws(
+                TEST_SECRET,
+                json!({"sub":"test","iss":"wrong-issuer","aud":TEST_AUDIENCE,"exp":1_717_171_718u64}),
+            )),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn wrong_audience_is_rejected() {
+        let response = call(
+            build_state(),
+            Method::POST,
+            "/api/v1/gm/revive",
+            json!({"character":"Qianfuren"}),
+            Some(&sign_test_jws(
+                TEST_SECRET,
+                json!({"sub":"test","iss":TEST_ISSUER,"aud":"wrong-audience","exp":1_717_171_718u64}),
+            )),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn audience_array_is_supported() {
+        let sink = Arc::new(RecordingSink::with_ready(true));
+        let state = Arc::new(AppState::new(
+            TEST_SECRET.to_string(),
+            TEST_ISSUER.to_string(),
+            TEST_AUDIENCE.to_string(),
+            DEFAULT_REALM_ID,
+            sink.clone(),
+            Arc::new(FixedClock(300)),
+        ));
+        let token = sign_test_jws(
+            TEST_SECRET,
+            json!({"sub":"test","iss":TEST_ISSUER,"aud":["other", TEST_AUDIENCE],"exp":301}),
+        );
+
+        let response = call(
+            state,
+            Method::POST,
+            "/api/v1/gm/revive",
+            json!({"character":"Qianfuren"}),
+            Some(&token),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CREATED);
     }
 }

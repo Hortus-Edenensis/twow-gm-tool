@@ -15,8 +15,9 @@ This keeps the write path outside the legacy gameplay core:
 
 All write endpoints require `Authorization: Bearer <JWS>`.
 The service verifies an `HS256` compact JWS signed with `GM_TOOL_JWS_SECRET`
-and requires a future `exp` claim. If `nbf` is present, it must already be
-effective.
+and requires exact `iss` / `aud` matches plus a future `exp` claim. If `nbf`
+is present, it must already be effective. The `aud` claim may be either a
+single string or an array that contains the expected audience.
 
 - `GET /healthz`
 - `GET /readyz`
@@ -66,6 +67,8 @@ The deployment reuses the existing governance-plane config map and DB secret:
 - `TWOW_DB_PASSWORD`
 - `TWOW_LOGON_DB`
 - `GM_TOOL_JWS_SECRET`
+- `GM_TOOL_JWS_ISSUER`
+- `GM_TOOL_JWS_AUDIENCE`
 - `GM_TOOL_BIND_ADDR` optional, default `0.0.0.0:8080`
 - `GM_TOOL_DEFAULT_REALM_ID` optional, default `1`
 
@@ -126,6 +129,8 @@ kubectl apply -f k8s/experiments/twow-gm-tool-k3s/proof-pod.yaml
 
 ```bash
 export GM_TOOL_JWS_SECRET='replace-me'
+export GM_TOOL_JWS_ISSUER='twow-control-plane'
+export GM_TOOL_JWS_AUDIENCE='twow-gm-tool'
 export GM_TOOL_JWS="$(python3 - <<'PY'
 import base64
 import hashlib
@@ -140,6 +145,8 @@ def b64u(value: bytes) -> str:
 header = b64u(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
 payload = b64u(json.dumps({
     "sub": "local-proof",
+    "iss": os.environ["GM_TOOL_JWS_ISSUER"],
+    "aud": os.environ["GM_TOOL_JWS_AUDIENCE"],
     "exp": int(time.time()) + 300
 }, separators=(",", ":")).encode())
 signature = b64u(hmac.new(
