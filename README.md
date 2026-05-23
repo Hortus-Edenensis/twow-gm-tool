@@ -1,15 +1,15 @@
 # twow-gm-tool
 
 `twow-gm-tool` is a small Rust control-plane service for a local Turtle WoW
-K3s lab. It exposes a narrow HTTP API and writes reviewed GM commands into
-`tw_logon.pending_commands`, which is already consumed by the existing world
-runtime.
+K3s lab. It exposes a narrow HTTP API and can either write reviewed GM
+commands into `tw_logon.pending_commands` or send them directly to the live
+world HTTP control surface.
 
-This keeps the write path outside the legacy gameplay core:
+This keeps the external write path outside the legacy gameplay core:
 
 - no `Player.cpp` or `Unit.cpp` changes
 - no new world-thread API surface inside `mangosd`
-- no direct DB write from untrusted callers beyond the existing queue contract
+- no direct DB write from untrusted callers beyond the existing sink contract
 
 ## API
 
@@ -69,8 +69,34 @@ The deployment reuses the existing governance-plane config map and DB secret:
 - `GM_TOOL_JWS_SECRET`
 - `GM_TOOL_JWS_ISSUER`
 - `GM_TOOL_JWS_AUDIENCE`
+- `GM_TOOL_COMMAND_ALLOWLIST` optional, default empty which disables raw `/api/v1/gm/commands`
+- `GM_TOOL_SINK_MODE` optional, default `pending_commands`
+- `GM_TOOL_WORLD_BASE_URL` required when `GM_TOOL_SINK_MODE=direct_world_http`
+- `GM_TOOL_WORLD_API_KEY` required when `GM_TOOL_SINK_MODE=direct_world_http`
+- `GM_TOOL_WORLD_TIMEOUT_SECONDS` optional, default `5`
 - `GM_TOOL_BIND_ADDR` optional, default `0.0.0.0:8080`
 - `GM_TOOL_DEFAULT_REALM_ID` optional, default `1`
+
+Supported sink modes:
+
+- `pending_commands`
+  - writes reviewed commands into `tw_logon.pending_commands`
+  - subject to world queue polling cadence
+- `direct_world_http`
+  - calls the live world HTTP API `/admin/gm/commands`
+  - near-real-time because it enters the world CLI queue directly
+
+Raw command allowlist behavior:
+
+- `POST /api/v1/gm/commands` is guarded by `GM_TOOL_COMMAND_ALLOWLIST`
+- the value is a comma-separated list of allowed command prefixes
+- a raw command is allowed when it exactly matches an entry or begins with that
+  entry followed by whitespace
+- example:
+  - `GM_TOOL_COMMAND_ALLOWLIST='broadcast,notify,revive,tele name'`
+- if the allowlist is empty, raw `/api/v1/gm/commands` returns `403`
+- structured endpoints `/api/v1/gm/revive` and `/api/v1/gm/teleport` are not
+  gated by this raw-command allowlist
 
 ## Local Build
 
@@ -104,7 +130,8 @@ Create the JWS signing secret out of band before the second apply:
 
 ```bash
 kubectl -n twow-control-plane create secret generic twow-gm-tool-secret \
-  --from-literal=GM_TOOL_JWS_SECRET='replace-me'
+  --from-literal=GM_TOOL_JWS_SECRET='replace-me' \
+  --from-literal=GM_TOOL_WORLD_API_KEY='Gheor'
 ```
 
 For a non-systemd local proof path, see the parent repo helper:

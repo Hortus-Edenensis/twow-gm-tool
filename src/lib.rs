@@ -1,15 +1,18 @@
 use std::convert::Infallible;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
+use std::net::TcpStream;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use http::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap};
-use http::{Method, Request, Response, StatusCode};
+use http::{Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use serde::{Deserialize, Serialize};
@@ -22,6 +25,8 @@ use std::sync::Mutex;
 
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
 const DEFAULT_REALM_ID_STR: &str = "1";
+const DEFAULT_SINK_MODE: &str = "pending_commands";
+const DEFAULT_WORLD_TIMEOUT_SECONDS_STR: &str = "5";
 const MAX_COMMAND_LEN: usize = 512;
 type HmacSha256 = Hmac<Sha256>;
 
@@ -30,6 +35,8 @@ pub type ResponseBody = Full<Bytes>;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
+    pub sink_mode: SinkMode,
+    pub command_allowlist: Vec<String>,
     pub jws_secret: String,
     pub jws_issuer: String,
     pub jws_audience: String,
@@ -39,6 +46,15 @@ pub struct Config {
     pub db_password: String,
     pub logon_db: String,
     pub default_realm_id: u32,
+    pub world_base_url: Option<String>,
+    pub world_api_key: Option<String>,
+    pub world_timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkMode {
+    PendingCommands,
+    DirectWorldHttp,
 }
 
 #[derive(Debug, Error)]
@@ -47,6 +63,8 @@ pub enum ConfigError {
     MissingEnv(&'static str),
     #[error("invalid socket address in GM_TOOL_BIND_ADDR: {0}")]
     InvalidBindAddr(String),
+    #[error("invalid GM_TOOL_SINK_MODE: {0}")]
+    InvalidSinkMode(String),
     #[error("invalid integer in {key}: {value}")]
     InvalidInteger { key: &'static str, value: String },
 }
@@ -57,6 +75,8 @@ impl Config {
         let bind_addr = bind_addr
             .parse::<SocketAddr>()
             .map_err(|_| ConfigError::InvalidBindAddr(bind_addr.clone()))?;
+        let sink_mode = parse_sink_mode("GM_TOOL_SINK_MODE", DEFAULT_SINK_MODE)?;
+        let command_allowlist = parse_command_allowlist_env("GM_TOOL_COMMAND_ALLOWLIST")?;
         let jws_secret = required_env("GM_TOOL_JWS_SECRET")?;
         let jws_issuer = required_env("GM_TOOL_JWS_ISSUER")?;
         let jws_audience = required_env("GM_TOOL_JWS_AUDIENCE")?;
@@ -66,9 +86,22 @@ impl Config {
         let db_password = required_env("TWOW_DB_PASSWORD")?;
         let logon_db = required_env("TWOW_LOGON_DB")?;
         let default_realm_id = parse_env_u32("GM_TOOL_DEFAULT_REALM_ID", DEFAULT_REALM_ID_STR)?;
+        let world_timeout_seconds = parse_env_u64(
+            "GM_TOOL_WORLD_TIMEOUT_SECONDS",
+            DEFAULT_WORLD_TIMEOUT_SECONDS_STR)?;
+        let world_base_url = match sink_mode {
+            SinkMode::PendingCommands => std::env::var("GM_TOOL_WORLD_BASE_URL").ok(),
+            SinkMode::DirectWorldHttp => Some(required_env("GM_TOOL_WORLD_BASE_URL")?),
+        };
+        let world_api_key = match sink_mode {
+            SinkMode::PendingCommands => std::env::var("GM_TOOL_WORLD_API_KEY").ok(),
+            SinkMode::DirectWorldHttp => Some(required_env("GM_TOOL_WORLD_API_KEY")?),
+        };
 
         Ok(Self {
             bind_addr,
+            sink_mode,
+            command_allowlist,
             jws_secret,
             jws_issuer,
             jws_audience,
@@ -78,6 +111,9 @@ impl Config {
             db_password,
             logon_db,
             default_realm_id,
+            world_base_url,
+            world_api_key,
+            world_timeout_seconds,
         })
     }
 }
@@ -100,12 +136,44 @@ fn parse_env_u32(key: &'static str, default: &'static str) -> Result<u32, Config
     value.parse::<u32>().map_err(|_| ConfigError::InvalidInteger { key, value })
 }
 
+fn parse_env_u64(key: &'static str, default: &'static str) -> Result<u64, ConfigError> {
+    let value = env_or_default(key, default);
+    value.parse::<u64>().map_err(|_| ConfigError::InvalidInteger { key, value })
+}
+
+fn parse_sink_mode(key: &'static str, default: &'static str) -> Result<SinkMode, ConfigError> {
+    let value = env_or_default(key, default);
+    match value.as_str() {
+        "pending_commands" => Ok(SinkMode::PendingCommands),
+        "direct_world_http" => Ok(SinkMode::DirectWorldHttp),
+        _ => Err(ConfigError::InvalidSinkMode(value)),
+    }
+}
+
+fn parse_command_allowlist_env(key: &'static str) -> Result<Vec<String>, ConfigError> {
+    let Some(raw_value) = std::env::var(key).ok() else {
+        return Ok(Vec::new());
+    };
+
+    raw_value
+        .split(',')
+        .map(normalize_allowlist_entry)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            validate_command(&entry)
+                .map(|_| entry)
+                .map_err(|error| ConfigError::InvalidSinkMode(format!("{key}: {error}")))
+        })
+        .collect()
+}
+
 #[derive(Clone)]
 pub struct AppState {
     jws_secret: Arc<Vec<u8>>,
     jws_issuer: Arc<String>,
     jws_audience: Arc<String>,
     default_realm_id: u32,
+    command_allowlist: Arc<Vec<String>>,
     sink: Arc<dyn CommandSink>,
     clock: Arc<dyn Clock>,
 }
@@ -116,6 +184,7 @@ impl AppState {
         jws_issuer: String,
         jws_audience: String,
         default_realm_id: u32,
+        command_allowlist: Vec<String>,
         sink: Arc<dyn CommandSink>,
         clock: Arc<dyn Clock>,
     ) -> Self {
@@ -124,6 +193,7 @@ impl AppState {
             jws_issuer: Arc::new(jws_issuer),
             jws_audience: Arc::new(jws_audience),
             default_realm_id,
+            command_allowlist: Arc::new(command_allowlist),
             sink,
             clock,
         }
@@ -246,10 +316,154 @@ impl CommandSink for MariadbCliSink {
     }
 }
 
+#[derive(Clone)]
+pub struct DirectWorldHttpSink {
+    world_base_url: String,
+    world_api_key: String,
+    host: String,
+    port: u16,
+    base_path: String,
+    timeout: Duration,
+}
+
+impl DirectWorldHttpSink {
+    pub fn from_config(config: &Config) -> Result<Self, AppError> {
+        let world_base_url = config
+            .world_base_url
+            .clone()
+            .ok_or_else(|| AppError::Dependency("GM_TOOL_WORLD_BASE_URL is required in direct_world_http mode".to_string()))?;
+        let world_api_key = config
+            .world_api_key
+            .clone()
+            .ok_or_else(|| AppError::Dependency("GM_TOOL_WORLD_API_KEY is required in direct_world_http mode".to_string()))?;
+
+        let uri: Uri = world_base_url
+            .parse()
+            .map_err(|error| AppError::Dependency(format!("invalid GM_TOOL_WORLD_BASE_URL: {error}")))?;
+
+        if uri.scheme_str() != Some("http") {
+            return Err(AppError::Dependency(
+                "GM_TOOL_WORLD_BASE_URL must use http scheme".to_string(),
+            ));
+        }
+
+        let host = uri
+            .host()
+            .ok_or_else(|| AppError::Dependency("GM_TOOL_WORLD_BASE_URL must include a host".to_string()))?
+            .to_string();
+        let port = uri.port_u16().unwrap_or(80);
+        let path = uri.path();
+        let base_path = if path.is_empty() { "/".to_string() } else { path.to_string() };
+
+        Ok(Self {
+            world_base_url,
+            world_api_key,
+            host,
+            port,
+            base_path,
+            timeout: Duration::from_secs(config.world_timeout_seconds.max(1)),
+        })
+    }
+
+    fn endpoint_path(&self, suffix: &str) -> String {
+        if self.base_path == "/" {
+            suffix.to_string()
+        } else {
+            format!("{}{}", self.base_path.trim_end_matches('/'), suffix)
+        }
+    }
+
+    fn perform_request(&self, method: &str, path: &str, body: Option<&str>) -> Result<(u16, String), AppError> {
+        let mut stream = TcpStream::connect((self.host.as_str(), self.port))
+            .map_err(|error| AppError::Dependency(format!("failed to connect to {}: {}",
+                self.world_base_url, error)))?;
+        stream
+            .set_read_timeout(Some(self.timeout))
+            .map_err(|error| AppError::Dependency(format!("failed to set read timeout: {error}")))?;
+        stream
+            .set_write_timeout(Some(self.timeout))
+            .map_err(|error| AppError::Dependency(format!("failed to set write timeout: {error}")))?;
+
+        let body = body.unwrap_or("");
+        let request = if body.is_empty() {
+            format!(
+                "{method} {path} HTTP/1.1\r\nHost: {}\r\nX-API-Key: {}\r\nConnection: close\r\n\r\n",
+                self.host, self.world_api_key
+            )
+        } else {
+            format!(
+                "{method} {path} HTTP/1.1\r\nHost: {}\r\nX-API-Key: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                self.host, self.world_api_key, body.len(), body
+            )
+        };
+
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|error| AppError::Upstream(format!("failed to write world API request: {error}")))?;
+        stream
+            .flush()
+            .map_err(|error| AppError::Upstream(format!("failed to flush world API request: {error}")))?;
+
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .map_err(|error| AppError::Upstream(format!("failed to read world API response: {error}")))?;
+
+        let mut sections = response.splitn(2, "\r\n\r\n");
+        let header_block = sections.next().unwrap_or_default();
+        let response_body = sections.next().unwrap_or_default().to_string();
+        let status_line = header_block.lines().next().unwrap_or_default();
+        let status_code = status_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_default()
+            .parse::<u16>()
+            .map_err(|_| AppError::Upstream(format!("unexpected world API status line: {status_line}")))?;
+
+        Ok((status_code, response_body))
+    }
+}
+
+impl CommandSink for DirectWorldHttpSink {
+    fn healthcheck(&self) -> Result<(), AppError> {
+        let path = self.endpoint_path("/healthz");
+        let (status_code, response_body) = self.perform_request("GET", &path, None)?;
+        if status_code == 200 {
+            return Ok(());
+        }
+
+        Err(AppError::Upstream(format!(
+            "world API healthcheck returned {status_code}: {}",
+            response_body.trim()
+        )))
+    }
+
+    fn enqueue(&self, request: QueueCommand) -> Result<QueueReceipt, AppError> {
+        let path = self.endpoint_path("/admin/gm/commands");
+        let body = json!({ "command": request.command }).to_string();
+        let (status_code, response_body) = self.perform_request("POST", &path, Some(&body))?;
+        if status_code == 200 || status_code == 201 || status_code == 202 {
+            return Ok(QueueReceipt {
+                id: 0,
+                realm_id: request.realm_id,
+                command: request.command,
+                run_at_unix: request.run_at_unix,
+            });
+        }
+
+        Err(AppError::Upstream(format!(
+            "world API command call returned {status_code}: {}",
+            response_body.trim()
+        )))
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error("unauthorized")]
     Unauthorized,
+    #[error("{0}")]
+    Forbidden(String),
     #[error("{0}")]
     BadRequest(String),
     #[error("{0}")]
@@ -264,6 +478,7 @@ impl AppError {
     fn status_code(&self) -> StatusCode {
         match self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Upstream(_) | Self::Dependency(_) => StatusCode::BAD_GATEWAY,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -449,6 +664,7 @@ async fn enqueue_from_raw(
     payload: RawCommandRequest,
 ) -> Result<Response<ResponseBody>, AppError> {
     let command = normalize_raw_command(&payload.command)?;
+    authorize_raw_command(state.command_allowlist.as_slice(), &command)?;
     enqueue_structured(state, payload.realm_id, payload.run_after_seconds, command).await
 }
 
@@ -577,6 +793,32 @@ fn build_teleport_command(character: &str, teleport: &str) -> Result<String, App
     Ok(format!("tele name {character} {teleport}"))
 }
 
+fn authorize_raw_command(allowlist: &[String], command: &str) -> Result<(), AppError> {
+    if allowlist.is_empty() {
+        return Err(AppError::Forbidden(
+            "raw gm commands are disabled because GM_TOOL_COMMAND_ALLOWLIST is empty".to_string(),
+        ));
+    }
+
+    if allowlist
+        .iter()
+        .any(|entry| command_matches_allowlist_entry(command, entry))
+    {
+        return Ok(());
+    }
+
+    Err(AppError::Forbidden(format!(
+        "raw gm command is not allowlisted: {command}"
+    )))
+}
+
+fn command_matches_allowlist_entry(command: &str, entry: &str) -> bool {
+    command == entry
+        || command
+            .strip_prefix(entry)
+            .is_some_and(|suffix| suffix.starts_with(char::is_whitespace))
+}
+
 fn validate_single_token(field: &str, value: &str) -> Result<String, AppError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -606,6 +848,10 @@ fn validate_command(command: &str) -> Result<(), AppError> {
         ));
     }
     Ok(())
+}
+
+fn normalize_allowlist_entry(value: &str) -> String {
+    value.trim().trim_start_matches('.').trim().to_string()
 }
 
 fn escape_sql_literal(value: &str) -> Result<String, AppError> {
@@ -689,6 +935,7 @@ mod tests {
             TEST_ISSUER.to_string(),
             TEST_AUDIENCE.to_string(),
             DEFAULT_REALM_ID,
+            Vec::new(),
             Arc::new(RecordingSink::with_ready(true)),
             Arc::new(FixedClock(1_717_171_717)),
         ))
@@ -735,6 +982,7 @@ mod tests {
             TEST_ISSUER.to_string(),
             TEST_AUDIENCE.to_string(),
             DEFAULT_REALM_ID,
+            Vec::new(),
             sink.clone(),
             Arc::new(FixedClock(100)),
         ));
@@ -789,6 +1037,7 @@ mod tests {
             TEST_ISSUER.to_string(),
             TEST_AUDIENCE.to_string(),
             DEFAULT_REALM_ID,
+            vec!["broadcast".to_string()],
             sink.clone(),
             Arc::new(FixedClock(200)),
         ));
@@ -810,6 +1059,67 @@ mod tests {
         let queued = sink.queued.lock().expect("queued lock");
         assert_eq!(queued[0].command, "broadcast hello");
         assert_eq!(queued[0].run_at_unix, 205);
+    }
+
+    #[tokio::test]
+    async fn raw_endpoint_rejects_non_allowlisted_commands() {
+        let sink = Arc::new(RecordingSink::with_ready(true));
+        let state = Arc::new(AppState::new(
+            TEST_SECRET.to_string(),
+            TEST_ISSUER.to_string(),
+            TEST_AUDIENCE.to_string(),
+            DEFAULT_REALM_ID,
+            vec!["broadcast".to_string()],
+            sink.clone(),
+            Arc::new(FixedClock(200)),
+        ));
+        let token = sign_test_jws(
+            TEST_SECRET,
+            json!({"sub":"test","iss":TEST_ISSUER,"aud":TEST_AUDIENCE,"exp":205}),
+        );
+
+        let response = call(
+            state,
+            Method::POST,
+            "/api/v1/gm/commands",
+            json!({"command":"saveall"}),
+            Some(&token),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(sink.queued.lock().expect("queued lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn raw_endpoint_allows_prefix_matches() {
+        let sink = Arc::new(RecordingSink::with_ready(true));
+        let state = Arc::new(AppState::new(
+            TEST_SECRET.to_string(),
+            TEST_ISSUER.to_string(),
+            TEST_AUDIENCE.to_string(),
+            DEFAULT_REALM_ID,
+            vec!["tele name".to_string()],
+            sink.clone(),
+            Arc::new(FixedClock(250)),
+        ));
+        let token = sign_test_jws(
+            TEST_SECRET,
+            json!({"sub":"test","iss":TEST_ISSUER,"aud":TEST_AUDIENCE,"exp":255}),
+        );
+
+        let response = call(
+            state,
+            Method::POST,
+            "/api/v1/gm/commands",
+            json!({"command":"tele name Qianfuren Goldshire"}),
+            Some(&token),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let queued = sink.queued.lock().expect("queued lock");
+        assert_eq!(queued[0].command, "tele name Qianfuren Goldshire");
     }
 
     #[tokio::test]
@@ -867,6 +1177,7 @@ mod tests {
             TEST_ISSUER.to_string(),
             TEST_AUDIENCE.to_string(),
             DEFAULT_REALM_ID,
+            Vec::new(),
             Arc::new(RecordingSink::with_ready(false)),
             Arc::new(FixedClock(0)),
         ));
@@ -920,6 +1231,7 @@ mod tests {
             TEST_ISSUER.to_string(),
             TEST_AUDIENCE.to_string(),
             DEFAULT_REALM_ID,
+            Vec::new(),
             sink.clone(),
             Arc::new(FixedClock(300)),
         ));
@@ -938,5 +1250,127 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[test]
+    fn direct_world_http_sink_posts_to_world_api() {
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let captured = Arc::new(Mutex::new(String::new()));
+        let captured_clone = captured.clone();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream.set_read_timeout(Some(Duration::from_millis(200))).expect("read timeout");
+            let mut request = String::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(read) => request.push_str(&String::from_utf8_lossy(&buf[..read])),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock || error.kind() == std::io::ErrorKind::TimedOut => break,
+                    Err(error) => panic!("read request: {error}"),
+                }
+            }
+            *captured_clone.lock().expect("captured lock") = request;
+            let response = "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}";
+            stream.write_all(response.as_bytes()).expect("write response");
+            stream.flush().expect("flush response");
+        });
+
+        let config = Config {
+            bind_addr: "127.0.0.1:8080".parse().expect("bind addr"),
+            sink_mode: SinkMode::DirectWorldHttp,
+            command_allowlist: vec!["broadcast".to_string()],
+            jws_secret: TEST_SECRET.to_string(),
+            jws_issuer: TEST_ISSUER.to_string(),
+            jws_audience: TEST_AUDIENCE.to_string(),
+            db_host: "ignored".to_string(),
+            db_port: 3306,
+            db_user: "ignored".to_string(),
+            db_password: "ignored".to_string(),
+            logon_db: "ignored".to_string(),
+            default_realm_id: DEFAULT_REALM_ID,
+            world_base_url: Some(format!("http://127.0.0.1:{}", addr.port())),
+            world_api_key: Some("Gheor".to_string()),
+            world_timeout_seconds: 5,
+        };
+        let sink = DirectWorldHttpSink::from_config(&config).expect("direct sink");
+
+        let receipt = sink
+            .enqueue(QueueCommand {
+                realm_id: 1,
+                command: "broadcast hello".to_string(),
+                run_at_unix: 123,
+            })
+            .expect("enqueue");
+
+        server.join().expect("server join");
+        let request = captured.lock().expect("captured lock").clone();
+
+        assert_eq!(receipt.id, 0);
+        assert!(request.contains("POST /admin/gm/commands HTTP/1.1"));
+        assert!(request.contains("X-API-Key: Gheor"));
+        assert!(request.contains("{\"command\":\"broadcast hello\"}"));
+    }
+
+    #[test]
+    fn direct_world_http_sink_healthcheck_uses_healthz() {
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let captured = Arc::new(Mutex::new(String::new()));
+        let captured_clone = captured.clone();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream.set_read_timeout(Some(Duration::from_millis(200))).expect("read timeout");
+            let mut request = String::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(read) => request.push_str(&String::from_utf8_lossy(&buf[..read])),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock || error.kind() == std::io::ErrorKind::TimedOut => break,
+                    Err(error) => panic!("read request: {error}"),
+                }
+            }
+            *captured_clone.lock().expect("captured lock") = request;
+            let response = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n";
+            stream.write_all(response.as_bytes()).expect("write response");
+            stream.flush().expect("flush response");
+        });
+
+        let config = Config {
+            bind_addr: "127.0.0.1:8080".parse().expect("bind addr"),
+            sink_mode: SinkMode::DirectWorldHttp,
+            command_allowlist: vec!["broadcast".to_string()],
+            jws_secret: TEST_SECRET.to_string(),
+            jws_issuer: TEST_ISSUER.to_string(),
+            jws_audience: TEST_AUDIENCE.to_string(),
+            db_host: "ignored".to_string(),
+            db_port: 3306,
+            db_user: "ignored".to_string(),
+            db_password: "ignored".to_string(),
+            logon_db: "ignored".to_string(),
+            default_realm_id: DEFAULT_REALM_ID,
+            world_base_url: Some(format!("http://127.0.0.1:{}", addr.port())),
+            world_api_key: Some("Gheor".to_string()),
+            world_timeout_seconds: 5,
+        };
+        let sink = DirectWorldHttpSink::from_config(&config).expect("direct sink");
+
+        sink.healthcheck().expect("healthcheck");
+
+        server.join().expect("server join");
+        let request = captured.lock().expect("captured lock").clone();
+        assert!(request.contains("GET /healthz HTTP/1.1"));
     }
 }
